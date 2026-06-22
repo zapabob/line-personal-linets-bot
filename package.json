@@ -1,0 +1,17 @@
+{
+  "name": "line-personal-linets-bot",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Personal LINE account bot worker built on @evex/linejs for local HTTP control, auto-replies, reply threading, and group moderation.",
+  "type": "module",
+  "scripts": {
+    "start": "node src/bridge.mjs",
+    "check": "node --check src/bridge.mjs"
+  },
+  "dependencies": {
+    "@evex/linejs": "npm:@jsr/evex__linejs@^3.1.4"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}

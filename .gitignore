@@ -1,0 +1,13 @@
+node_modules/
+.env
+.env.*
+!.env.example
+linejs-storage.json
+linejs-group-banlist.json
+bridge.log
+bridge.pid
+auth-backups/
+*.bak
+*.log
+npm-debug.log*
+.DS_Store
