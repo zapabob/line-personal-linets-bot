@@ -14,6 +14,8 @@ function lineEnv(suffix, fallbackPersonal = true) {
 const host = lineEnv("HOST", false) || "127.0.0.1";
 const port = Number(lineEnv("PORT", false) || "9101");
 const device = lineEnv("DEVICE") || "DESKTOPWIN";
+const loginMode = (lineEnv("LOGIN_MODE", false) || "auto").toLowerCase();
+const disableQrLogin = loginMode === "email_password" || loginMode === "password" || /^(1|true|yes)$/i.test(lineEnv("DISABLE_QR", false) || "");
 const storagePath = lineEnv("STORAGE", false) || "./linejs-storage.json";
 const allowedUsers = new Set((lineEnv("ALLOWED_USERS") || "").split(",").map(s => s.trim()).filter(Boolean));
 const groupAdminMids = new Set((lineEnv("GROUP_ADMIN_MIDS") || lineEnv("GROUP_ADMINS") || "").split(",").map(s => s.trim()).filter(Boolean));
@@ -373,6 +375,8 @@ async function startLogin() {
           pushEvent("login:pin", { pin });
         },
       }, init);
+    } else if (disableQrLogin) {
+      throw new Error("email_password_login_required: LINEJS_PERSONAL_EMAIL and LINEJS_PERSONAL_PASSWORD must be configured; QR login is disabled");
     } else {
       pushEvent("login:qr:start", { device });
       client = await loginWithQR({
@@ -418,8 +422,14 @@ async function startLogin() {
         const handledAdmin = await handleAdminCommand(message, chatMid, isGroup);
         if (handledAdmin) return;
 
-        // Auto-reply logic
-        if (autoReplyEnabled && message.text && !message.isMyMessage) {
+        // Forward every non-self group message to the Go webhook server.
+        // Go decides whether to reply (tag or reply-to-us) and sends via /send.
+        if (!message.isMyMessage && isGroup) {
+          forwardToGoWebhook(message, chatMid);
+        }
+
+        // Auto-reply logic (legacy; disabled - Go webhook now owns replies)
+        if (false && autoReplyEnabled && message.text && !message.isMyMessage) {
           const hasTrigger = hasTriggerTag(message.text);
           const replyTargetId = getReplyTargetId(message);
           const isReplyToUs = Boolean(replyTargetId && sentMessageIds.has(replyTargetId));
@@ -427,7 +437,7 @@ async function startLogin() {
           // Check conditions: group only (if enabled), has trigger tag or replies to our recent message.
           if ((!autoReplyOnlyGroups || isGroup) && (hasTrigger || isReplyToUs) && canReply(`${chatMid}:${replyTargetId || "tag"}`, isReplyToUs ? 30000 : autoReplyCooldownMs)) {
             let replyText = `呼んだ？`;
-            
+
             // If webhook configured, call it for dynamic reply generation
             if (autoReplyWebhook) {
               (async () => {
@@ -492,12 +502,50 @@ async function startLogin() {
     client.on("call:incoming", (event) => pushEvent("call:incoming", { event }));
     client.on("call:cancel", (event) => pushEvent("call:cancel", { event }));
     client.listen({ talk: true, square: false });
+
+    // Keep connection alive; auto re-login if token logs out.
+    startKeepalive();
   } catch (err) {
     loginState = "error";
     loginError = redactError(err);
     pushEvent("login:error", { error: loginError });
   }
 }
+
+  // ---- Keepalive / auto re-login on token logout ----
+  function startKeepalive() {
+    setInterval(async () => {
+      try {
+        if (!client || loginState === "error") {
+          pushEvent("login:relogin:attempt", { reason: "token_or_state_error" });
+          await startLogin();
+        }
+      } catch (err) {
+        pushEvent("login:relogin:error", { error: redactError(err) });
+      }
+    }, 20000);
+  }
+
+  // ---- Forward received group messages to Go webhook server ----
+  const webhookForwardUrl = (lineEnv("WEBHOOK_FORWARD_URL") || "http://127.0.0.1:9102/webhook").trim();
+
+  function forwardToGoWebhook(message, chatMid) {
+    const payload = JSON.stringify({
+      messageId: message.raw?.id,
+      text: message.text,
+      from: message.from,
+      to: chatMid,
+      isMyMessage: message.isMyMessage,
+      isGroup: isGroupChat(message),
+      replyTargetId: getReplyTargetId(message),
+      isReplyToUs: false,
+    });
+    fetch(webhookForwardUrl, {
+      method: "POST",
+      headers: { "content-type": "application/json; charset=utf-8" },
+      body: payload,
+    }).catch(err => pushEvent("webhook:forward_error", { error: redactError(err) }));
+  }
 
 const server = http.createServer(async (req, res) => {
   try {
@@ -535,9 +583,10 @@ const server = http.createServer(async (req, res) => {
           : { to, text, e2ee: body.e2ee !== false };
         result = await client.base.talk.sendMessage(payload);
       }
-      pushEvent("send", { to, textPreview: text.slice(0, 80), length: text.length, relatedMessageId: relatedMessageId || null });
+      const sentIds = rememberSentMessage(result);
+      pushEvent("send", { to, textPreview: text.slice(0, 80), length: text.length, relatedMessageId: relatedMessageId || null, sentIds });
 
-      return sendJson(res, 200, { ok: true, result });
+      return sendJson(res, 200, { ok: true, result, sentIds });
     }
     return sendJson(res, 404, { ok: false, error: "not_found" });
   } catch (err) {
